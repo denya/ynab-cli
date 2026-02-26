@@ -1,5 +1,6 @@
 .coverage
 .env*
+.claude/settings.local.json
 rules.json
 
 __pycache__/
