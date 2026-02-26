@@ -9,8 +9,10 @@ def init_container(container: Container) -> Container:
     from ynab_cli.adapters.ynab.client import AuthenticatedClient
     from ynab_cli.domain.ports.io import IO
     from ynab_cli.domain.settings import Settings
+    from ynab_cli.domain.use_cases import accounts as accounts_use_cases
     from ynab_cli.domain.use_cases import budgets as budgets_use_cases
     from ynab_cli.domain.use_cases import categories as categories_use_cases
+    from ynab_cli.domain.use_cases import months as months_use_cases
     from ynab_cli.domain.use_cases import payees as payees_use_cases
     from ynab_cli.domain.use_cases import transactions as transactions_use_cases
 
@@ -28,6 +30,10 @@ def init_container(container: Container) -> Container:
     # Use Cases
     #
 
+    container[accounts_use_cases.ListAll] = lambda c: accounts_use_cases.ListAll(
+        c[IO],
+        c[AuthenticatedClient],
+    )
     container[budgets_use_cases.ListAll] = lambda c: budgets_use_cases.ListAll(
         c[IO],
         c[AuthenticatedClient],
@@ -37,6 +43,18 @@ def init_container(container: Container) -> Container:
         c[AuthenticatedClient],
     )
     container[categories_use_cases.ListAll] = lambda c: categories_use_cases.ListAll(
+        c[IO],
+        c[AuthenticatedClient],
+    )
+    container[categories_use_cases.UpdateBudget] = lambda c: categories_use_cases.UpdateBudget(
+        c[IO],
+        c[AuthenticatedClient],
+    )
+    container[months_use_cases.ListAll] = lambda c: months_use_cases.ListAll(
+        c[IO],
+        c[AuthenticatedClient],
+    )
+    container[months_use_cases.Show] = lambda c: months_use_cases.Show(
         c[IO],
         c[AuthenticatedClient],
     )
@@ -57,6 +75,34 @@ def init_container(container: Container) -> Container:
         c[AuthenticatedClient],
     )
     container[transactions_use_cases.ApplyRules] = lambda c: transactions_use_cases.ApplyRules(
+        c[IO],
+        c[AuthenticatedClient],
+    )
+    container[transactions_use_cases.ListAll] = lambda c: transactions_use_cases.ListAll(
+        c[IO],
+        c[AuthenticatedClient],
+    )
+    container[transactions_use_cases.Create] = lambda c: transactions_use_cases.Create(
+        c[IO],
+        c[AuthenticatedClient],
+    )
+    container[transactions_use_cases.Transfer] = lambda c: transactions_use_cases.Transfer(
+        c[IO],
+        c[AuthenticatedClient],
+    )
+    container[transactions_use_cases.Update] = lambda c: transactions_use_cases.Update(
+        c[IO],
+        c[AuthenticatedClient],
+    )
+    container[transactions_use_cases.Delete] = lambda c: transactions_use_cases.Delete(
+        c[IO],
+        c[AuthenticatedClient],
+    )
+    container[transactions_use_cases.BulkCreate] = lambda c: transactions_use_cases.BulkCreate(
+        c[IO],
+        c[AuthenticatedClient],
+    )
+    container[transactions_use_cases.ImportLinked] = lambda c: transactions_use_cases.ImportLinked(
         c[IO],
         c[AuthenticatedClient],
     )

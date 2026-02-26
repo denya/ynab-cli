@@ -1,8 +1,9 @@
 import json
 from collections.abc import AsyncIterator, Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
+from uuid import UUID
 
 import pytest
 from click.testing import CliRunner
@@ -63,3 +64,53 @@ def test_apply_rules(
         Settings(ynab=YnabSettings(access_token="test_token", budget_id="test_budget")),
         {"dry_run": False, "transaction_rules": transaction_rules},
     )
+
+
+def test_delete_json_outputs_deleted_transaction(
+    runner: CliRunner, container: Container, empty_uuid: UUID
+) -> None:
+    async def delete(*args: Any, **kwargs: Any) -> AsyncIterator[models.TransactionDetail]:
+        yield cast(
+            models.TransactionDetail,
+            ynab.TransactionDetailFactory.build(
+                id=empty_uuid,
+                deleted=False,
+                account_name="Checking",
+                amount=-12345,
+            ),
+        )
+
+    use_case = MagicMock(wraps=delete)
+    container[use_cases.Delete] = use_case
+
+    result = runner.invoke(
+        cli,
+        [
+            "run",
+            "--access-token",
+            "test_token",
+            "--output",
+            "json",
+            "transactions",
+            "--budget-id",
+            "test_budget",
+            "delete",
+            "--yes",
+            str(empty_uuid),
+        ],
+    )
+
+    assert result.exit_code == 0
+    use_case.assert_called_once_with(
+        Settings(
+            ynab=YnabSettings(access_token="test_token", budget_id="test_budget"),
+            output_format="json",
+        ),
+        {"transaction_id": str(empty_uuid)},
+    )
+
+    payload = json.loads(result.output)
+    assert len(payload) == 1
+    assert payload[0]["id"] == str(empty_uuid)
+    assert payload[0]["account"] == "Checking"
+    assert payload[0]["amount"] == -12.345

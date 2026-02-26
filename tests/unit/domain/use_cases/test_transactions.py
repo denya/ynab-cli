@@ -1,6 +1,7 @@
 from http import HTTPStatus
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 
 import pytest
 from pytest_mock import MockerFixture
@@ -178,3 +179,133 @@ async def test_apply_rules_exception(
         pass
 
     mock_io.print.assert_called_with(expected_print)
+
+
+@pytest.mark.anyio
+async def test_list_all_with_account_filter_forwards_type_param(
+    mocker: MockerFixture, mock_io: MagicMock, empty_uuid: UUID
+) -> None:
+    txn = cast(models.TransactionDetail, ynab.TransactionDetailFactory.build(deleted=False))
+    account = models.Account(
+        id=empty_uuid,
+        name="Checking",
+        type_=models.AccountType.CHECKING,
+        on_budget=True,
+        closed=False,
+        balance=0,
+        cleared_balance=0,
+        uncleared_balance=0,
+        transfer_payee_id=None,
+        deleted=False,
+    )
+
+    mocker.patch(
+        "ynab_cli.domain.use_cases.transactions._fuzzy_resolve_account",
+        new=AsyncMock(return_value=account),
+    )
+    mock_get_asyncio_detailed = mocker.patch(
+        "ynab_cli.domain.use_cases.transactions.util.get_asyncio_detailed",
+        new_callable=AsyncMock,
+    )
+    mock_get_asyncio_detailed.return_value = models.TransactionsResponse(
+        data=models.TransactionsResponseData(
+            transactions=[txn],
+            server_knowledge=0,
+        )
+    )
+
+    settings = Settings()
+    settings.ynab.budget_id = "budget-id"
+    params: use_cases.ListAllParams = {
+        "account_name": "checking",
+        "type_": "unapproved",
+    }
+
+    results = [transaction async for transaction in use_cases.ListAll(mock_io, MagicMock())(settings, params)]
+    assert results == [txn]
+
+    assert mock_get_asyncio_detailed.await_count == 1
+    assert mock_get_asyncio_detailed.await_args.kwargs["type_"] == models.GetTransactionsByAccountType.UNAPPROVED
+
+
+@pytest.mark.anyio
+async def test_bulk_create_skips_transaction_when_category_is_not_found(
+    mocker: MockerFixture, mock_io: MagicMock, empty_uuid: UUID
+) -> None:
+    account = models.Account(
+        id=empty_uuid,
+        name="Checking",
+        type_=models.AccountType.CHECKING,
+        on_budget=True,
+        closed=False,
+        balance=0,
+        cleared_balance=0,
+        uncleared_balance=0,
+        transfer_payee_id=None,
+        deleted=False,
+    )
+    valid_category = models.Category(
+        id=empty_uuid,
+        category_group_id=empty_uuid,
+        name="Groceries",
+        hidden=False,
+        budgeted=0,
+        activity=0,
+        balance=0,
+        deleted=False,
+    )
+
+    mocker.patch(
+        "ynab_cli.domain.use_cases.transactions._fuzzy_resolve_account",
+        new=AsyncMock(return_value=account),
+    )
+    mocker.patch(
+        "ynab_cli.domain.use_cases.transactions._fuzzy_resolve_payee",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "ynab_cli.domain.use_cases.transactions._fuzzy_resolve_category",
+        new=AsyncMock(side_effect=[None, valid_category]),
+    )
+
+    txn = cast(models.TransactionDetail, ynab.TransactionDetailFactory.build(deleted=False))
+    mock_get_asyncio_detailed = mocker.patch(
+        "ynab_cli.domain.use_cases.transactions.util.get_asyncio_detailed",
+        new_callable=AsyncMock,
+    )
+    mock_get_asyncio_detailed.return_value = models.SaveTransactionsResponse(
+        data=models.SaveTransactionsResponseData(
+            transaction_ids=[str(txn.id)],
+            server_knowledge=0,
+            transactions=[txn],
+        )
+    )
+
+    settings = Settings()
+    settings.ynab.budget_id = "budget-id"
+    params: use_cases.BulkCreateParams = {
+        "transactions": [
+            {
+                "account_name": "Checking",
+                "payee_name": "No Match",
+                "amount_dollars": 10.0,
+                "category_name": "Missing",
+            },
+            {
+                "account_name": "Checking",
+                "payee_name": "No Match",
+                "amount_dollars": 20.0,
+                "category_name": "Groceries",
+            },
+        ]
+    }
+
+    results = [transaction async for transaction in use_cases.BulkCreate(mock_io, MagicMock())(settings, params)]
+    assert results == [txn]
+
+    assert mock_get_asyncio_detailed.await_count == 1
+    body = mock_get_asyncio_detailed.await_args.kwargs["body"]
+    assert isinstance(body, models.PostTransactionsWrapper)
+    assert len(body.transactions) == 1
+    assert body.transactions[0].category_id == empty_uuid
+    mock_io.print.assert_any_call("Category not found: Missing, skipping for this transaction.")

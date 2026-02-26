@@ -1,9 +1,12 @@
+from typing import Any
+
 import anyio
 import click
 from lagom import Container
 
 from ynab_cli.domain.settings import Settings
 from ynab_cli.domain.use_cases import budgets as use_cases
+from ynab_cli.host.click.commands.output import print_json
 from ynab_cli.host.click.commands.rich.progress_table import ProgressTable
 from ynab_cli.host.click.container import containerize
 from ynab_cli.host.constants import CONTEXT_KEY_SETTINGS
@@ -20,6 +23,13 @@ class ListAllCommand:
 
     async def __call__(self, settings: Settings) -> None:
         params: use_cases.ListAllParams = {}
+
+        if settings.output_format == "json":
+            rows: list[dict[str, Any]] = []
+            async for budget in self._use_case(settings, params):
+                rows.append({"id": str(budget.id), "name": str(budget.name)})
+            print_json(rows)
+            return
 
         console = None
         with self._progress_table:
@@ -43,7 +53,10 @@ async def _list_all(container: Container) -> None:
 @click.command()
 @click.pass_context
 def list_all(ctx: click.Context) -> None:
-    """List all budgets in YNAB."""
+    """List all budgets in YNAB.
+
+    JSON output fields: id, name. Use the budget ID for --budget-id in other commands.
+    """
 
     ctx.ensure_object(dict)
     settings: Settings = ctx.obj.get(CONTEXT_KEY_SETTINGS, Settings())

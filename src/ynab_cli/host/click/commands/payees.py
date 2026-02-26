@@ -1,9 +1,12 @@
+from typing import Any
+
 import anyio
 import click
 from lagom import Container
 
 from ynab_cli.domain.settings import Settings
 from ynab_cli.domain.use_cases import payees as use_cases
+from ynab_cli.host.click.commands.output import print_json
 from ynab_cli.host.click.commands.rich.progress_table import ProgressTable
 from ynab_cli.host.click.container import containerize
 from ynab_cli.host.constants import CONTEXT_KEY_SETTINGS, ENV_PREFIX
@@ -23,6 +26,17 @@ class NormalizeNamesCommand:
         params: use_cases.NormalizeNamesParams = {
             "dry_run": dry_run,
         }
+
+        if settings.output_format == "json":
+            rows: list[dict[str, Any]] = []
+            async for payee, normalized_name in self._use_case(settings, params):
+                rows.append({
+                    "id": str(payee.id),
+                    "name": payee.name,
+                    "normalized_name": normalized_name,
+                })
+            print_json(rows)
+            return
 
         console = None
         with self._progress_table:
@@ -52,6 +66,18 @@ class ListDuplicatesCommand:
 
     async def __call__(self, settings: Settings) -> None:
         params: use_cases.ListDuplicatesParams = {}
+
+        if settings.output_format == "json":
+            rows: list[dict[str, Any]] = []
+            async for payee, duplicate_payee in self._use_case(settings, params):
+                rows.append({
+                    "id": str(payee.id),
+                    "name": payee.name,
+                    "duplicate_id": str(duplicate_payee.id),
+                    "duplicate_name": duplicate_payee.name,
+                })
+            print_json(rows)
+            return
 
         console = None
         with self._progress_table:
@@ -84,6 +110,13 @@ class ListUnusedCommand:
             "prefix_unused": prefix_unused,
         }
 
+        if settings.output_format == "json":
+            rows: list[dict[str, Any]] = []
+            async for payee in self._use_case(settings, params):
+                rows.append({"id": str(payee.id), "name": payee.name})
+            print_json(rows)
+            return
+
         console = None
         with self._progress_table:
             console = self._progress_table.console
@@ -110,6 +143,13 @@ class ListAllCommand:
     async def __call__(self, settings: Settings) -> None:
         params: use_cases.ListAllParams = {}
 
+        if settings.output_format == "json":
+            rows: list[dict[str, Any]] = []
+            async for payee in self._use_case(settings, params):
+                rows.append({"id": str(payee.id), "name": payee.name})
+            print_json(rows)
+            return
+
         console = None
         with self._progress_table:
             console = self._progress_table.console
@@ -133,7 +173,10 @@ async def _normalize_names(container: Container, dry_run: bool) -> None:
 @click.option("--dry-run", is_flag=True, default=False, help="Run without making any changes.")
 @click.pass_context
 def normalize_names(ctx: click.Context, dry_run: bool) -> None:
-    """Normalize payee names in the YNAB budget."""
+    """Normalize payee names in the YNAB budget.
+
+    JSON output fields: id, name, normalized_name.
+    """
 
     ctx.ensure_object(dict)
     settings: Settings = ctx.obj.get(CONTEXT_KEY_SETTINGS, Settings())
@@ -155,7 +198,10 @@ async def _list_duplicates(container: Container) -> None:
 @click.command()
 @click.pass_context
 def list_duplicates(ctx: click.Context) -> None:
-    """List duplicate payees in the YNAB budget."""
+    """List duplicate payees in the YNAB budget.
+
+    JSON output fields: id, name, duplicate_id, duplicate_name.
+    """
 
     ctx.ensure_object(dict)
     settings: Settings = ctx.obj.get(CONTEXT_KEY_SETTINGS, Settings())
@@ -178,7 +224,10 @@ async def _list_unused(container: Container, dry_run: bool, prefix_unused: bool)
 @click.option("--prefix-unused", is_flag=True, default=False, help="Add a prefix to the unused payee names.")
 @click.pass_context
 def list_unused(ctx: click.Context, dry_run: bool, prefix_unused: bool) -> None:
-    """List unused payees in the YNAB budget."""
+    """List unused payees in the YNAB budget.
+
+    JSON output fields: id, name.
+    """
 
     ctx.ensure_object(dict)
     settings: Settings = ctx.obj.get(CONTEXT_KEY_SETTINGS, Settings())
@@ -201,7 +250,10 @@ async def _list_all(container: Container) -> None:
 @click.command()
 @click.pass_context
 def list_all(ctx: click.Context) -> None:
-    """List all payees in the YNAB budget."""
+    """List all payees in the YNAB budget.
+
+    JSON output fields: id, name.
+    """
 
     ctx.ensure_object(dict)
     settings: Settings = ctx.obj.get(CONTEXT_KEY_SETTINGS, Settings())

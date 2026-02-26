@@ -10,3 +10,5 @@ class YnabSettings:
 @define
 class Settings:
     ynab: YnabSettings = field(factory=YnabSettings)
+    output_format: str = "table"
+    show_ids: bool = False
