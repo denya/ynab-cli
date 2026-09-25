@@ -2,14 +2,13 @@ import datetime
 from collections.abc import AsyncIterator
 from typing import TypedDict
 
-from rapidfuzz import process
-
 from ynab_cli.adapters import ynab
 from ynab_cli.adapters.ynab import models, util
 from ynab_cli.adapters.ynab.api.categories import get_categories, update_month_category
 from ynab_cli.adapters.ynab.api.transactions import get_transactions_by_category
 from ynab_cli.domain import ports
 from ynab_cli.domain.settings import Settings
+from ynab_cli.domain.use_cases import resolve
 
 
 def _should_skip_category_or_group(category_or_group: models.Category | models.CategoryGroupWithCategories) -> bool:
@@ -139,6 +138,8 @@ class UpdateBudgetParams(TypedDict, total=False):
     category_name: str
     amount_dollars: float
     month: str | None
+    fuzzy_category: bool
+    """Opt-in: fall back to the closest category (score >= 60) when there is no exact match."""
 
 
 class UpdateBudget:
@@ -152,36 +153,13 @@ class UpdateBudget:
         try:
             progress_total = 0
 
-            # Resolve category by fuzzy name
-            category_groups = (
-                await util.get_asyncio_detailed(
-                    self._io, get_categories.asyncio_detailed, settings.ynab.budget_id, client=self._client
-                )
-            ).data.category_groups
-            all_categories = [c for g in category_groups for c in g.categories if not c.deleted and not c.hidden]
-
+            # Resolve category: exact (case-insensitive) by default, fuzzy only if opted in
+            all_categories = await resolve.fetch_categories(self._io, self._client, settings.ynab.budget_id)
             category_name = params["category_name"]
-            matched_cat: models.Category | None = None
-
-            # Exact match first
-            for c in all_categories:
-                if c.name.lower() == category_name.lower():
-                    matched_cat = c
-                    break
-
-            # Fuzzy fallback
+            match = resolve.match_category(category_name, all_categories, fuzzy=bool(params.get("fuzzy_category")))
+            matched_cat = match.item
             if not matched_cat:
-                names = [c.name for c in all_categories]
-                result = process.extractOne(category_name, names, score_cutoff=60)
-                if result:
-                    matched_name, _score, _idx = result
-                    for c in all_categories:
-                        if c.name == matched_name:
-                            matched_cat = c
-                            break
-
-            if not matched_cat:
-                await self._io.print(f"Category not found: {category_name}")
+                await self._io.print(resolve.not_found_message("Category", category_name, match, "--fuzzy-category"))
                 return
 
             # Determine month
