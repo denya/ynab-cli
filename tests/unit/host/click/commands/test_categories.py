@@ -3,6 +3,7 @@ from typing import Any
 from unittest.mock import MagicMock
 from uuid import UUID
 
+import pytest
 from click.testing import CliRunner
 from lagom import Container
 
@@ -62,3 +63,33 @@ def test_list_all(runner: CliRunner, container: Container, empty_uuid: UUID) -> 
     use_case.assert_called_once_with(
         Settings(ynab=YnabSettings(access_token="test_token", budget_id="test_budget")), {}
     )
+
+
+@pytest.mark.parametrize(("flags", "expected"), [([], False), (["--fuzzy-category"], True), (["--fuzzy"], True)])
+def test_update_budget_fuzzy_category_flag(
+    flags: list[str], expected: bool, runner: CliRunner, container: Container, empty_uuid: UUID
+) -> None:
+    async def update_budget(*args: Any, **kwargs: Any) -> AsyncIterator[models.Category]:
+        yield models.Category(
+            id=empty_uuid,
+            category_group_id=empty_uuid,
+            name="Groceries",
+            hidden=False,
+            budgeted=0,
+            activity=0,
+            balance=0,
+            deleted=False,
+        )
+
+    use_case = MagicMock(wraps=update_budget)
+    container[use_cases.UpdateBudget] = use_case
+
+    result = runner.invoke(
+        cli,
+        [
+            *["run", "--access-token", "t", "categories", "--budget-id", "b", "update-budget"],
+            *["--category", "Grocery", "--amount", "10", *flags],
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert use_case.call_args.args[1]["fuzzy_category"] is expected

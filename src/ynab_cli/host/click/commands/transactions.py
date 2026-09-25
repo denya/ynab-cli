@@ -1,5 +1,6 @@
 import json
-from typing import IO, Any
+from collections.abc import Callable
+from typing import IO, Any, TypeVar
 
 import anyio
 import click
@@ -8,6 +9,7 @@ from lagom import Container
 from ynab_cli.domain.models import rules
 from ynab_cli.domain.settings import Settings
 from ynab_cli.domain.use_cases import transactions as use_cases
+from ynab_cli.domain.use_cases.resolve import PayeeStatus
 from ynab_cli.host.click.commands.output import print_json
 from ynab_cli.host.click.commands.rich.progress_table import ProgressTable
 from ynab_cli.host.click.container import containerize
@@ -111,6 +113,49 @@ def transactions(ctx: click.Context, budget_id: str) -> None:
 
 
 transactions.add_command(apply_rules)
+
+
+_FUZZY_HELP = "Opt-in: if there is no exact (case-insensitive) match, use the closest {what} (fuzzy score >= 60)."
+
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _fuzzy_options(*, payee: bool = True, category: bool = True, account: bool = True) -> Callable[[_F], _F]:
+    """Add --fuzzy-payee/--fuzzy-category/--fuzzy-account and --fuzzy (all of them) options."""
+
+    def decorator(f: _F) -> _F:
+        if account:
+            f = click.option(
+                "--fuzzy-account", is_flag=True, default=False, help=_FUZZY_HELP.format(what="existing account")
+            )(f)
+        if category:
+            f = click.option(
+                "--fuzzy-category", is_flag=True, default=False, help=_FUZZY_HELP.format(what="existing category")
+            )(f)
+        if payee:
+            f = click.option(
+                "--fuzzy-payee",
+                is_flag=True,
+                default=False,
+                help=_FUZZY_HELP.format(what="existing payee")
+                + " Without it, an unknown payee name creates a new payee.",
+            )(f)
+        return click.option(
+            "--fuzzy", is_flag=True, default=False, help="Shortcut for all --fuzzy-* options of this command."
+        )(f)
+
+    return decorator
+
+
+def _fuzzy_flags(
+    fuzzy: bool, *, payee: bool = False, category: bool = False, account: bool = False
+) -> dict[str, bool]:
+    return {
+        "fuzzy_payee": fuzzy or payee,
+        "fuzzy_category": fuzzy or category,
+        "fuzzy_account": fuzzy or account,
+    }
 
 
 def _format_amount(milliunits: int) -> str:
@@ -284,6 +329,7 @@ class CreateCommand:
         memo: str | None,
         date: str | None,
         cleared: bool,
+        fuzzy: dict[str, bool] | None = None,
     ) -> None:
         params: use_cases.CreateParams = {
             "account_name": account,
@@ -293,6 +339,7 @@ class CreateCommand:
             "memo": memo,
             "date": date,
             "cleared": cleared,
+            **(fuzzy or {}),  # type: ignore[typeddict-item]
         }
 
         if settings.output_format == "json":
@@ -336,18 +383,25 @@ async def _create(
     memo: str | None,
     date: str | None,
     cleared: bool,
+    fuzzy: dict[str, bool],
 ) -> None:
-    await container[CreateCommand](container[Settings], account, payee, amount, category, memo, date, cleared)
+    await container[CreateCommand](container[Settings], account, payee, amount, category, memo, date, cleared, fuzzy)
 
 
 @click.command()
-@click.option("--account", required=True, help="Account name (fuzzy match).")
-@click.option("--payee", required=True, help="Payee name (fuzzy match, auto-creates if not found).")
+@click.option("--account", required=True, help="Account name (exact, case-insensitive).")
+@click.option(
+    "--payee",
+    required=True,
+    help="Payee name (exact, case-insensitive; creates a new payee if none matches). "
+    "'Transfer : <Account>' creates a transfer.",
+)
 @click.option("--amount", required=True, type=float, help="Amount in dollars (negative=outflow, positive=inflow).")
-@click.option("--category", default=None, help="Category name (fuzzy match).")
+@click.option("--category", default=None, help="Category name (exact, case-insensitive).")
 @click.option("--memo", default=None, help="Transaction memo.")
 @click.option("--date", default=None, help="Transaction date (YYYY-MM-DD, defaults to today).")
 @click.option("--cleared", is_flag=True, default=False, help="Mark transaction as cleared.")
+@_fuzzy_options()
 @click.pass_context
 def create(
     ctx: click.Context,
@@ -358,9 +412,15 @@ def create(
     memo: str | None,
     date: str | None,
     cleared: bool,
+    fuzzy: bool,
+    fuzzy_payee: bool,
+    fuzzy_category: bool,
+    fuzzy_account: bool,
 ) -> None:
     """Create a new transaction in the YNAB budget.
 
+    Names are matched exactly (case-insensitive). An unknown payee name creates a new
+    payee; use --fuzzy-payee to reuse the closest existing payee instead.
     JSON output always includes the transaction ID for follow-up operations.
     """
 
@@ -378,6 +438,7 @@ def create(
         memo,
         date,
         cleared,
+        _fuzzy_flags(fuzzy, payee=fuzzy_payee, category=fuzzy_category, account=fuzzy_account),
         backend_options={"use_uvloop": True},
     )
 
@@ -405,6 +466,7 @@ class TransferCommand:
         amount: float,
         memo: str | None,
         date: str | None,
+        fuzzy_account: bool = False,
     ) -> None:
         params: use_cases.TransferParams = {
             "from_account_name": from_account,
@@ -412,6 +474,7 @@ class TransferCommand:
             "amount_dollars": amount,
             "memo": memo,
             "date": date,
+            "fuzzy_account": fuzzy_account,
         }
 
         if settings.output_format == "json":
@@ -459,16 +522,18 @@ async def _transfer(
     amount: float,
     memo: str | None,
     date: str | None,
+    fuzzy_account: bool,
 ) -> None:
-    await container[TransferCommand](container[Settings], from_account, to_account, amount, memo, date)
+    await container[TransferCommand](container[Settings], from_account, to_account, amount, memo, date, fuzzy_account)
 
 
 @click.command()
-@click.option("--from", "from_account", required=True, help="Source account name (fuzzy match).")
-@click.option("--to", "to_account", required=True, help="Target account name (fuzzy match).")
+@click.option("--from", "from_account", required=True, help="Source account name (exact, case-insensitive).")
+@click.option("--to", "to_account", required=True, help="Target account name (exact, case-insensitive).")
 @click.option("--amount", required=True, type=float, help="Amount in dollars (positive).")
 @click.option("--memo", default=None, help="Transfer memo.")
 @click.option("--date", default=None, help="Transfer date (YYYY-MM-DD, defaults to today).")
+@_fuzzy_options(payee=False, category=False)
 @click.pass_context
 def transfer(
     ctx: click.Context,
@@ -477,6 +542,8 @@ def transfer(
     amount: float,
     memo: str | None,
     date: str | None,
+    fuzzy: bool,
+    fuzzy_account: bool,
 ) -> None:
     """Transfer between two accounts in the YNAB budget.
 
@@ -495,6 +562,7 @@ def transfer(
         amount,
         memo,
         date,
+        fuzzy or fuzzy_account,
         backend_options={"use_uvloop": True},
     )
 
@@ -528,6 +596,7 @@ class UpdateCommand:
         date: str | None,
         cleared: bool | None,
         approved: bool | None,
+        fuzzy: dict[str, bool] | None = None,
     ) -> None:
         params: use_cases.UpdateParams = {
             "transaction_id": transaction_id,
@@ -539,6 +608,7 @@ class UpdateCommand:
             "date": date,
             "cleared": cleared,
             "approved": approved,
+            **(fuzzy or {}),  # type: ignore[typeddict-item]
         }
 
         if settings.output_format == "json":
@@ -579,22 +649,29 @@ async def _update(
     date: str | None,
     cleared: bool | None,
     approved: bool | None,
+    fuzzy: dict[str, bool],
 ) -> None:
     await container[UpdateCommand](
-        container[Settings], transaction_id, account, payee, amount, category, memo, date, cleared, approved
+        container[Settings], transaction_id, account, payee, amount, category, memo, date, cleared, approved, fuzzy
     )
 
 
 @click.command()
 @click.argument("transaction-id")
-@click.option("--account", default=None, help="New account name (fuzzy match).")
-@click.option("--payee", default=None, help="New payee name (fuzzy match).")
+@click.option("--account", default=None, help="New account name (exact, case-insensitive).")
+@click.option(
+    "--payee",
+    default=None,
+    help="New payee name (exact, case-insensitive; creates a new payee if none matches). "
+    "'Transfer : <Account>' makes it a transfer.",
+)
 @click.option("--amount", default=None, type=float, help="New amount in dollars.")
-@click.option("--category", default=None, help="New category name (fuzzy match).")
+@click.option("--category", default=None, help="New category name (exact, case-insensitive).")
 @click.option("--memo", default=None, help="New memo.")
 @click.option("--date", default=None, help="New date (YYYY-MM-DD).")
 @click.option("--cleared/--uncleared", default=None, help="Set cleared status.")
 @click.option("--approved/--unapproved", default=None, help="Set approved status.")
+@_fuzzy_options()
 @click.pass_context
 def update(
     ctx: click.Context,
@@ -607,6 +684,10 @@ def update(
     date: str | None,
     cleared: bool | None,
     approved: bool | None,
+    fuzzy: bool,
+    fuzzy_payee: bool,
+    fuzzy_category: bool,
+    fuzzy_account: bool,
 ) -> None:
     """Update an existing transaction by TRANSACTION_ID.
 
@@ -630,6 +711,7 @@ def update(
         date,
         cleared,
         approved,
+        _fuzzy_flags(fuzzy, payee=fuzzy_payee, category=fuzzy_category, account=fuzzy_account),
         backend_options={"use_uvloop": True},
     )
 
@@ -723,6 +805,7 @@ class BulkCreateCommand:
         self._progress_table.table.add_column("Date")
         self._progress_table.table.add_column("Account")
         self._progress_table.table.add_column("Payee")
+        self._progress_table.table.add_column("Payee Status")
         self._progress_table.table.add_column("Category")
         self._progress_table.table.add_column("Memo")
         self._progress_table.table.add_column("Amount", justify="right")
@@ -732,23 +815,36 @@ class BulkCreateCommand:
 
         if settings.output_format == "json":
             rows: list[dict[str, Any]] = []
-            async for txn in self._use_case(settings, params):
-                rows.append(_txn_to_dict(txn, show_ids=True))
+            async for result in self._use_case(settings, params):
+                row = _txn_to_dict(result.transaction, show_ids=True)
+                if result.payee is not None:
+                    row["payee_status"] = result.payee.status.value
+                    row["payee_requested"] = result.payee.requested
+                rows.append(row)
             print_json(rows)
             return
 
         if settings.show_ids:
             self._progress_table.table.add_column("ID", no_wrap=True)
 
+        created: list[str] = []
+        fuzzy_matched: list[str] = []
         console = None
         with self._progress_table:
             console = self._progress_table.console
 
-            async for txn in self._use_case(settings, params):
+            async for result in self._use_case(settings, params):
+                txn = result.transaction
+                status = result.payee.status.value if result.payee else ""
+                if result.payee and result.payee.status == PayeeStatus.CREATED:
+                    created.append(result.payee.requested)
+                if result.payee and result.payee.status == PayeeStatus.FUZZY_MATCHED:
+                    fuzzy_matched.append(f"{result.payee.requested} -> {result.payee.payee_name}")
                 row_values = [
                     txn.date.isoformat(),
                     str(txn.account_name),
                     str(txn.payee_name or ""),
+                    status,
                     str(txn.category_name or ""),
                     str(txn.memo or ""),
                     _format_amount(txn.amount),
@@ -759,27 +855,45 @@ class BulkCreateCommand:
 
         if console:
             console.print(self._progress_table.table)
+            if created:
+                console.print("New payees created: " + ", ".join(dict.fromkeys(created)))
+            if fuzzy_matched:
+                console.print("Fuzzy-matched payees: " + ", ".join(dict.fromkeys(fuzzy_matched)))
 
 
 @containerize
-async def _bulk_create(container: Container, transactions_json: str) -> None:
+async def _bulk_create(container: Container, transactions_json: str, fuzzy: dict[str, bool]) -> None:
     import json
 
     transactions_data: list[use_cases.CreateParams] = json.loads(transactions_json)
+    # Command-line flags are defaults; per-row fuzzy_* keys override them.
+    transactions_data = [{**fuzzy, **row} for row in transactions_data]  # type: ignore[typeddict-item]
     await container[BulkCreateCommand](container[Settings], transactions_data)
 
 
 @click.command("bulk-create")
 @click.argument("transactions-file", type=click.File())
+@_fuzzy_options()
 @click.pass_context
-def bulk_create(ctx: click.Context, transactions_file: Any) -> None:
+def bulk_create(
+    ctx: click.Context,
+    transactions_file: Any,
+    fuzzy: bool,
+    fuzzy_payee: bool,
+    fuzzy_category: bool,
+    fuzzy_account: bool,
+) -> None:
     """Bulk create transactions from a JSON TRANSACTIONS_FILE.
 
     The file should contain a JSON array of objects with keys:
     account_name, payee_name, amount_dollars, and optionally
-    category_name, memo, date (YYYY-MM-DD), cleared (bool).
+    category_name, memo, date (YYYY-MM-DD), cleared (bool), and
+    fuzzy_payee / fuzzy_category / fuzzy_account (bool, per-row override
+    of the --fuzzy-* flags).
 
-    JSON output always includes transaction IDs.
+    Names are matched exactly (case-insensitive); unknown payee names create
+    new payees. Output reports each row's payee_status: created, matched,
+    fuzzy_matched or transfer. JSON output always includes transaction IDs.
     """
 
     ctx.ensure_object(dict)
@@ -790,6 +904,7 @@ def bulk_create(ctx: click.Context, transactions_file: Any) -> None:
         _bulk_create,
         settings,
         transactions_file.read(),
+        _fuzzy_flags(fuzzy, payee=fuzzy_payee, category=fuzzy_category, account=fuzzy_account),
         backend_options={"use_uvloop": True},
     )
 

@@ -178,11 +178,14 @@ class UpdateBudgetCommand:
         self._progress_table.table.add_column("Activity", justify="right")
         self._progress_table.table.add_column("Balance", justify="right")
 
-    async def __call__(self, settings: Settings, category: str, amount: float, month: str | None) -> None:
+    async def __call__(
+        self, settings: Settings, category: str, amount: float, month: str | None, fuzzy_category: bool = False
+    ) -> None:
         params: use_cases.UpdateBudgetParams = {
             "category_name": category,
             "amount_dollars": amount,
             "month": month,
+            "fuzzy_category": fuzzy_category,
         }
 
         if settings.output_format == "json":
@@ -217,16 +220,26 @@ class UpdateBudgetCommand:
 
 
 @containerize
-async def _update_budget(container: Container, category: str, amount: float, month: str | None) -> None:
-    await container[UpdateBudgetCommand](container[Settings], category, amount, month)
+async def _update_budget(
+    container: Container, category: str, amount: float, month: str | None, fuzzy_category: bool
+) -> None:
+    await container[UpdateBudgetCommand](container[Settings], category, amount, month, fuzzy_category)
 
 
 @click.command()
-@click.option("--category", required=True, help="Category name (fuzzy match).")
+@click.option("--category", required=True, help="Category name (exact, case-insensitive).")
 @click.option("--amount", required=True, type=float, help="Budgeted amount in dollars.")
 @click.option("--month", default=None, help="Budget month (YYYY-MM-DD, first of month). Defaults to current month.")
+@click.option(
+    "--fuzzy-category",
+    "--fuzzy",
+    "fuzzy_category",
+    is_flag=True,
+    default=False,
+    help="Opt-in: if there is no exact (case-insensitive) match, use the closest category (fuzzy score >= 60).",
+)
 @click.pass_context
-def update_budget(ctx: click.Context, category: str, amount: float, month: str | None) -> None:
+def update_budget(ctx: click.Context, category: str, amount: float, month: str | None, fuzzy_category: bool) -> None:
     """Update a category's budgeted amount for a month.
 
     JSON output fields: name, budgeted, activity, balance, id (with --show-ids).
@@ -242,6 +255,7 @@ def update_budget(ctx: click.Context, category: str, amount: float, month: str |
         category,
         amount,
         month,
+        fuzzy_category,
         backend_options={"use_uvloop": True},
     )
 

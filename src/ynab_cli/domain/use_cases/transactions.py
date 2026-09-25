@@ -1,16 +1,14 @@
 import datetime
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, replace
 from typing import TypedDict
 
 import rule_engine
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz
 
 from ynab_cli.adapters import ynab
 from ynab_cli.adapters.ynab import models, util
-from ynab_cli.adapters.ynab.api.accounts import get_accounts
-from ynab_cli.adapters.ynab.api.categories import get_categories
-from ynab_cli.adapters.ynab.api.payees import get_payees
 from ynab_cli.adapters.ynab.api.transactions import (
     create_transaction,
     delete_transaction,
@@ -25,6 +23,7 @@ from ynab_cli.adapters.ynab.types import UNSET, Unset
 from ynab_cli.domain import ports
 from ynab_cli.domain.models import rules
 from ynab_cli.domain.settings import Settings
+from ynab_cli.domain.use_cases import resolve
 
 
 def _should_skip_transaction(transaction: models.TransactionDetail) -> bool:
@@ -125,68 +124,55 @@ class ApplyRules:
 async def _fuzzy_resolve_account(
     io: ports.IO, client: ynab.AuthenticatedClient, budget_id: str, account_name: str
 ) -> models.Account | None:
-    accounts = (
-        await util.get_asyncio_detailed(io, get_accounts.asyncio_detailed, budget_id, client=client)
-    ).data.accounts
-    active = [a for a in accounts if not a.deleted and not a.closed]
-
-    for a in active:
-        if a.name.lower() == account_name.lower():
-            return a
-
-    names = [a.name for a in active]
-    result = process.extractOne(account_name, names, score_cutoff=60)
-    if result:
-        matched_name, _score, _idx = result
-        for a in active:
-            if a.name == matched_name:
-                return a
-
-    return None
+    """Resolve an account for read-only filtering (exact first, then fuzzy)."""
+    accounts = await resolve.fetch_accounts(io, client, budget_id)
+    return resolve.match_account(account_name, accounts, fuzzy=True).item
 
 
-async def _fuzzy_resolve_payee(
-    io: ports.IO, client: ynab.AuthenticatedClient, budget_id: str, payee_name: str
-) -> models.Payee | None:
-    payees = (await util.get_asyncio_detailed(io, get_payees.asyncio_detailed, budget_id, client=client)).data.payees
-    active = [p for p in payees if not p.deleted]
-
-    for p in active:
-        if p.name.lower() == payee_name.lower():
-            return p
-
-    names = [p.name for p in active]
-    result = process.extractOne(payee_name, names, score_cutoff=60)
-    if result:
-        matched_name, _score, _idx = result
-        for p in active:
-            if p.name == matched_name:
-                return p
-
-    return None
+def _parse_date(date_str: str | None) -> datetime.date:
+    return datetime.date.fromisoformat(date_str) if date_str else datetime.datetime.now(tz=datetime.UTC).date()
 
 
-async def _fuzzy_resolve_category(
-    io: ports.IO, client: ynab.AuthenticatedClient, budget_id: str, category_name: str
-) -> models.Category | None:
-    category_groups = (
-        await util.get_asyncio_detailed(io, get_categories.asyncio_detailed, budget_id, client=client)
-    ).data.category_groups
-    all_categories = [c for g in category_groups for c in g.categories if not c.deleted and not c.hidden]
+class _Lookups:
+    """Lazily fetched (and cached) budget entities used for name resolution."""
 
-    for c in all_categories:
-        if c.name.lower() == category_name.lower():
-            return c
+    def __init__(self, io: ports.IO, client: ynab.AuthenticatedClient, budget_id: str) -> None:
+        self._io = io
+        self._client = client
+        self._budget_id = budget_id
+        self._accounts: list[models.Account] | None = None
+        self._payees: list[models.Payee] | None = None
+        self._categories: list[models.Category] | None = None
 
-    names = [c.name for c in all_categories]
-    result = process.extractOne(category_name, names, score_cutoff=60)
-    if result:
-        matched_name, _score, _idx = result
-        for c in all_categories:
-            if c.name == matched_name:
-                return c
+    async def accounts(self) -> list[models.Account]:
+        if self._accounts is None:
+            self._accounts = await resolve.fetch_accounts(self._io, self._client, self._budget_id)
+        return self._accounts
 
-    return None
+    async def payees(self) -> list[models.Payee]:
+        if self._payees is None:
+            self._payees = await resolve.fetch_payees(self._io, self._client, self._budget_id)
+        return self._payees
+
+    async def categories(self) -> list[models.Category]:
+        if self._categories is None:
+            self._categories = await resolve.fetch_categories(self._io, self._client, self._budget_id)
+        return self._categories
+
+    async def account(self, name: str, *, fuzzy: bool) -> tuple[models.Account | None, str | None]:
+        match = resolve.match_account(name, await self.accounts(), fuzzy=fuzzy)
+        if match.item is None:
+            return None, resolve.not_found_message("Account", name, match, "--fuzzy-account")
+        return match.item, None
+
+    async def category(self, name: str, *, fuzzy: bool) -> tuple[models.Category | None, str | None]:
+        match = resolve.match_category(name, await self.categories(), fuzzy=fuzzy)
+        if match.item is None:
+            return None, resolve.not_found_message("Category", name, match, "--fuzzy-category")
+        return match.item, None
+
+    async def payee(self, name: str, *, fuzzy: bool) -> resolve.PayeeResolution:
+        return resolve.resolve_payee(name, await self.payees(), await self.accounts(), fuzzy=fuzzy)
 
 
 class ListAllParams(TypedDict, total=False):
@@ -293,6 +279,52 @@ class CreateParams(TypedDict, total=False):
     memo: str | None
     date: str | None
     cleared: bool
+    fuzzy_payee: bool
+    """Opt-in: fall back to the closest existing payee (score >= 60) instead of creating a new one."""
+    fuzzy_category: bool
+    """Opt-in: fall back to the closest category (score >= 60) when there is no exact match."""
+    fuzzy_account: bool
+    """Opt-in: fall back to the closest account (score >= 60) when there is no exact match."""
+
+
+async def _build_new_transaction(
+    io: ports.IO, lookups: _Lookups, txn_params: CreateParams
+) -> tuple[models.NewTransaction, resolve.PayeeResolution] | str:
+    """Resolve names and build a NewTransaction. Returns an error message string on failure."""
+    account, err = await lookups.account(txn_params["account_name"], fuzzy=bool(txn_params.get("fuzzy_account")))
+    if account is None:
+        return err or f"Account not found: {txn_params['account_name']}"
+
+    try:
+        payee = await lookups.payee(txn_params["payee_name"], fuzzy=bool(txn_params.get("fuzzy_payee")))
+    except resolve.PayeeResolutionError as e:
+        return str(e)
+
+    category_id: None | uuid.UUID | Unset = UNSET
+    category_name = txn_params.get("category_name")
+    if category_name:
+        category, err = await lookups.category(category_name, fuzzy=bool(txn_params.get("fuzzy_category")))
+        if category is None:
+            return err or f"Category not found: {category_name}"
+        category_id = category.id
+
+    cleared = (
+        models.TransactionClearedStatus.CLEARED
+        if txn_params.get("cleared")
+        else models.TransactionClearedStatus.UNCLEARED
+    )
+    new_txn = models.NewTransaction(
+        account_id=account.id,
+        date=_parse_date(txn_params.get("date")),
+        amount=round(txn_params["amount_dollars"] * 1000),
+        payee_id=payee.payee_id if payee.payee_id else UNSET,
+        payee_name=txn_params["payee_name"].strip() if not payee.payee_id else UNSET,
+        category_id=category_id,
+        memo=txn_params.get("memo") or UNSET,
+        cleared=cleared,
+        approved=True,
+    )
+    return new_txn, payee
 
 
 class Create:
@@ -306,54 +338,12 @@ class Create:
         try:
             progress_total = 0
 
-            # Resolve account
-            account = await _fuzzy_resolve_account(
-                self._io, self._client, settings.ynab.budget_id, params["account_name"]
-            )
-            if not account:
-                await self._io.print(f"Account not found: {params['account_name']}")
+            lookups = _Lookups(self._io, self._client, settings.ynab.budget_id)
+            built = await _build_new_transaction(self._io, lookups, params)
+            if isinstance(built, str):
+                await self._io.print(built)
                 return
-
-            # Resolve payee
-            payee_id: models.Payee | None = await _fuzzy_resolve_payee(
-                self._io, self._client, settings.ynab.budget_id, params["payee_name"]
-            )
-
-            # Resolve category
-            category_id: None | uuid.UUID | Unset = UNSET
-            category_name_param = params.get("category_name")
-            if category_name_param:
-                category = await _fuzzy_resolve_category(
-                    self._io, self._client, settings.ynab.budget_id, category_name_param
-                )
-                if category:
-                    category_id = category.id
-                else:
-                    await self._io.print(f"Category not found: {category_name_param}")
-                    return
-
-            amount_milliunits = round(params["amount_dollars"] * 1000)
-            date_str = params.get("date")
-            txn_date = (
-                datetime.date.fromisoformat(date_str) if date_str else datetime.datetime.now(tz=datetime.UTC).date()
-            )
-            cleared = (
-                models.TransactionClearedStatus.CLEARED
-                if params.get("cleared")
-                else models.TransactionClearedStatus.UNCLEARED
-            )
-
-            new_txn = models.NewTransaction(
-                account_id=account.id,
-                date=txn_date,
-                amount=amount_milliunits,
-                payee_id=payee_id.id if payee_id else UNSET,
-                payee_name=params["payee_name"] if not payee_id else UNSET,
-                category_id=category_id,
-                memo=params.get("memo") or UNSET,
-                cleared=cleared,
-                approved=True,
-            )
+            new_txn, _payee = built
 
             response = await util.get_asyncio_detailed(
                 self._io,
@@ -394,6 +384,9 @@ class UpdateParams(TypedDict, total=False):
     date: str | None
     cleared: bool | None
     approved: bool | None
+    fuzzy_payee: bool
+    fuzzy_category: bool
+    fuzzy_account: bool
 
 
 class Update:
@@ -408,43 +401,36 @@ class Update:
             progress_total = 0
 
             txn_id = params["transaction_id"]
+            lookups = _Lookups(self._io, self._client, settings.ynab.budget_id)
 
             # Build ExistingTransaction with only the fields being updated
             existing_txn_kwargs: dict[str, object] = {}
 
-            if params.get("account_name"):
-                account = await _fuzzy_resolve_account(
-                    self._io,
-                    self._client,
-                    settings.ynab.budget_id,
-                    params["account_name"],  # type: ignore[arg-type]
-                )
-                if not account:
-                    await self._io.print(f"Account not found: {params['account_name']}")
+            account_name = params.get("account_name")
+            if account_name:
+                account, err = await lookups.account(account_name, fuzzy=bool(params.get("fuzzy_account")))
+                if account is None:
+                    await self._io.print(err or f"Account not found: {account_name}")
                     return
                 existing_txn_kwargs["account_id"] = account.id
 
-            if params.get("payee_name"):
-                payee = await _fuzzy_resolve_payee(
-                    self._io,
-                    self._client,
-                    settings.ynab.budget_id,
-                    params["payee_name"],  # type: ignore[arg-type]
-                )
-                if payee:
-                    existing_txn_kwargs["payee_id"] = payee.id
+            payee_name = params.get("payee_name")
+            if payee_name:
+                try:
+                    payee = await lookups.payee(payee_name, fuzzy=bool(params.get("fuzzy_payee")))
+                except resolve.PayeeResolutionError as e:
+                    await self._io.print(str(e))
+                    return
+                if payee.payee_id:
+                    existing_txn_kwargs["payee_id"] = payee.payee_id
                 else:
-                    existing_txn_kwargs["payee_name"] = params["payee_name"]
+                    existing_txn_kwargs["payee_name"] = payee_name.strip()
 
-            if params.get("category_name"):
-                category = await _fuzzy_resolve_category(
-                    self._io,
-                    self._client,
-                    settings.ynab.budget_id,
-                    params["category_name"],  # type: ignore[arg-type]
-                )
-                if not category:
-                    await self._io.print(f"Category not found: {params['category_name']}")
+            category_name = params.get("category_name")
+            if category_name:
+                category, err = await lookups.category(category_name, fuzzy=bool(params.get("fuzzy_category")))
+                if category is None:
+                    await self._io.print(err or f"Category not found: {category_name}")
                     return
                 existing_txn_kwargs["category_id"] = category.id
 
@@ -550,91 +536,104 @@ class BulkCreateParams(TypedDict):
     transactions: list[CreateParams]
 
 
+@dataclass(frozen=True)
+class BulkCreateResult:
+    transaction: models.TransactionDetail
+    payee: resolve.PayeeResolution | None
+    """How the payee was resolved (None if the created transaction could not be mapped back to its row)."""
+
+
+def _pair_results(
+    created: list[models.TransactionDetail],
+    pending: list[tuple[models.NewTransaction, resolve.PayeeResolution]],
+    known_payee_ids: set[uuid.UUID],
+) -> list[BulkCreateResult]:
+    """Map created transactions back to their input rows (by position, verified by account/date/amount)."""
+
+    def key(account_id: object, date: object, amount: object) -> tuple[str, str, int]:
+        return (str(account_id), str(date), int(amount))  # type: ignore[call-overload]
+
+    remaining = list(range(len(pending)))
+    results: list[BulkCreateResult] = []
+    for pos, txn in enumerate(created):
+        txn_key = key(txn.account_id, txn.date, txn.amount)
+        idx: int | None = None
+        if (
+            pos in remaining
+            and key(pending[pos][0].account_id, pending[pos][0].date, pending[pos][0].amount) == txn_key
+        ):
+            idx = pos
+        else:
+            idx = next(
+                (
+                    i
+                    for i in remaining
+                    if key(pending[i][0].account_id, pending[i][0].date, pending[i][0].amount) == txn_key
+                ),
+                None,
+            )
+        payee: resolve.PayeeResolution | None = None
+        if idx is not None:
+            remaining.remove(idx)
+            payee = pending[idx][1]
+            # YNAB may still match payee_name to an existing payee (e.g. created meanwhile).
+            if (
+                payee.status == resolve.PayeeStatus.CREATED
+                and isinstance(txn.payee_id, uuid.UUID)
+                and txn.payee_id in known_payee_ids
+            ):
+                payee = replace(payee, status=resolve.PayeeStatus.MATCHED, payee_id=txn.payee_id)
+        results.append(BulkCreateResult(transaction=txn, payee=payee))
+    return results
+
+
 class BulkCreate:
-    """Use case for creating multiple transactions at once."""
+    """Use case for creating multiple transactions at once.
+
+    Accounts, payees and categories are fetched once per call. Each row may set
+    ``fuzzy_payee`` / ``fuzzy_category`` / ``fuzzy_account`` to opt in to fuzzy matching.
+    """
 
     def __init__(self, io: ports.IO, client: ynab.AuthenticatedClient):
         self._io = io
         self._client = client
 
-    async def __call__(self, settings: Settings, params: BulkCreateParams) -> AsyncIterator[models.TransactionDetail]:
+    async def __call__(self, settings: Settings, params: BulkCreateParams) -> AsyncIterator[BulkCreateResult]:
         try:
             progress_total = 0
 
-            new_txns: list[models.NewTransaction] = []
+            lookups = _Lookups(self._io, self._client, settings.ynab.budget_id)
+            pending: list[tuple[models.NewTransaction, resolve.PayeeResolution]] = []
             for txn_params in params["transactions"]:
-                # Resolve account
-                account = await _fuzzy_resolve_account(
-                    self._io, self._client, settings.ynab.budget_id, txn_params["account_name"]
-                )
-                if not account:
-                    await self._io.print(f"Account not found: {txn_params['account_name']}, skipping.")
+                built = await _build_new_transaction(self._io, lookups, txn_params)
+                if isinstance(built, str):
+                    await self._io.print(f"{built}, skipping.")
                     continue
+                pending.append(built)
 
-                # Resolve payee
-                payee = await _fuzzy_resolve_payee(
-                    self._io, self._client, settings.ynab.budget_id, txn_params["payee_name"]
-                )
-
-                # Resolve category
-                cat_id: None | uuid.UUID | Unset = UNSET
-                cat_name = txn_params.get("category_name")
-                if cat_name:
-                    cat = await _fuzzy_resolve_category(self._io, self._client, settings.ynab.budget_id, cat_name)
-                    if cat:
-                        cat_id = cat.id
-                    else:
-                        await self._io.print(f"Category not found: {cat_name}, skipping for this transaction.")
-                        continue
-
-                amount_milliunits = round(txn_params["amount_dollars"] * 1000)
-                txn_date_str = txn_params.get("date")
-                txn_date = (
-                    datetime.date.fromisoformat(txn_date_str)
-                    if txn_date_str
-                    else datetime.datetime.now(tz=datetime.UTC).date()
-                )
-                cleared = (
-                    models.TransactionClearedStatus.CLEARED
-                    if txn_params.get("cleared")
-                    else models.TransactionClearedStatus.UNCLEARED
-                )
-
-                new_txns.append(
-                    models.NewTransaction(
-                        account_id=account.id,
-                        date=txn_date,
-                        amount=amount_milliunits,
-                        payee_id=payee.id if payee else UNSET,
-                        payee_name=txn_params["payee_name"] if not payee else UNSET,
-                        category_id=cat_id,
-                        memo=txn_params.get("memo") or UNSET,
-                        cleared=cleared,
-                        approved=True,
-                    )
-                )
-
-            if not new_txns:
+            if not pending:
                 await self._io.print("No valid transactions to create.")
                 return
+
+            known_payee_ids = {p.id for p in await lookups.payees()}
 
             response = await util.get_asyncio_detailed(
                 self._io,
                 create_transaction.asyncio_detailed,
                 settings.ynab.budget_id,
                 client=self._client,
-                body=models.PostTransactionsWrapper(transactions=new_txns),
+                body=models.PostTransactionsWrapper(transactions=[t for t, _ in pending]),
             )
 
             created_txns = response.data.transactions
             if isinstance(created_txns, list):
                 progress_total = len(created_txns)
                 await self._io.progress.update(total=progress_total)
-                for txn in created_txns:
+                for result in _pair_results(created_txns, pending, known_payee_ids):
                     await self._io.progress.update(advance=1)
-                    yield txn
+                    yield result
             else:
-                await self._io.print(f"Created {len(new_txns)} transactions (no details returned).")
+                await self._io.print(f"Created {len(pending)} transactions (no details returned).")
 
         except Exception as e:
             if isinstance(e, util.ApiError) and e.status_code == 401:
@@ -693,6 +692,7 @@ class TransferParams(TypedDict, total=False):
     amount_dollars: float
     memo: str | None
     date: str | None
+    fuzzy_account: bool
 
 
 class Transfer:
@@ -706,18 +706,17 @@ class Transfer:
         try:
             progress_total = 0
 
-            from_account = await _fuzzy_resolve_account(
-                self._io, self._client, settings.ynab.budget_id, params["from_account_name"]
-            )
+            lookups = _Lookups(self._io, self._client, settings.ynab.budget_id)
+            fuzzy_account = bool(params.get("fuzzy_account"))
+
+            from_account, err = await lookups.account(params["from_account_name"], fuzzy=fuzzy_account)
             if not from_account:
-                await self._io.print(f"Source account not found: {params['from_account_name']}")
+                await self._io.print(f"Source {err[0].lower()}{err[1:]}" if err else "Source account not found")
                 return
 
-            to_account = await _fuzzy_resolve_account(
-                self._io, self._client, settings.ynab.budget_id, params["to_account_name"]
-            )
+            to_account, err = await lookups.account(params["to_account_name"], fuzzy=fuzzy_account)
             if not to_account:
-                await self._io.print(f"Target account not found: {params['to_account_name']}")
+                await self._io.print(f"Target {err[0].lower()}{err[1:]}" if err else "Target account not found")
                 return
 
             if not to_account.transfer_payee_id:
